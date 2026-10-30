@@ -3,15 +3,36 @@
 Two tiny sidecar services that let a **Muse Code subscription key** be used through **9router**,
 without patching 9router's bundle.
 
+There are **two entry paths** — the adapter is on both, the gateway only on one:
+
 ```
-muse CLI ──▶ muse-gateway :20133 ──▶ 9router :20127 ──▶ muse-adapter :20132 ──▶ api.meta.ai
+Any OpenAI-compatible client          muse CLI (Muse Code)
+ (Hermes, Claude Code, curl, ...)          │
+            │                              ▼
+            │                     muse-gateway :20133   ← only for the Muse CLI
+            │                              │
+            └──────────────┬───────────────┘
+                           ▼
+                    9router :20127
+                           ▼
+                  muse-adapter :20132
+                           ▼
+                     api.meta.ai
 ```
+
+- **`muse-adapter` (:20132)** sits in front of `api.meta.ai` and is used by *everything* —
+  it is the layer that fixes Meta's attestation gate, tool arguments, and edge flakes.
+  9router's `muse` connection points here (`baseUrl = http://127.0.0.1:20132/v1`).
+- **`muse-gateway` (:20133)** is an *optional entry shim for the Muse Code CLI only*. Normal
+  clients (Hermes, Claude Code, curl, anything OpenAI-compatible) call 9router directly at
+  `:20127` and never touch it. The CLI needs it because it hardcodes its own Muse key and
+  polls `GET /muse-code/models` (outside `/v1`), which plain 9router does not serve.
 
 Both are plain Python 3 stdlib, no dependencies, systemd-managed.
 
 ---
 
-## The two problems this solves
+## The problems this solves
 
 ### 1. `403 client_attestation_denied` (muse-adapter)
 
@@ -110,6 +131,21 @@ What it does:
 > otherwise the 403 returns.
 
 ## Use
+
+### Normal clients (Hermes, [CC], curl, any [OI]-compatible app)
+
+Nothing to do — call 9router directly. The adapter is already behind it.
+
+```bash
+curl http://127.0.0.1:20127/v1/chat/completions \
+  -H "Authorization: Bearer $(cat /poki/tools/muse-adapter/9router.key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"thtung-muse","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+```
+
+### Muse Code CLI
+
+The CLI must enter through the gateway, not 9router directly.
 
 ```bash
 muse exec \
