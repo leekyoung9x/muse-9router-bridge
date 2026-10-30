@@ -1,204 +1,115 @@
 # Muse Code ⇄ 9router bridge
 
-Two tiny sidecar services that let a **Muse Code subscription key** be used through **9router**,
+Use a **Muse Code subscription key** through **9router** (or any OpenAI-compatible gateway),
 without patching 9router's bundle.
 
-There are **two entry paths** — the adapter is on both, the gateway only on one:
+Meta gates those keys with `403 client_attestation_denied` and quietly degrades tool calls when
+the request does not look like it came from Muse Code. This repo is two small stdlib-only Python
+sidecars that repair the traffic in flight and leave 9router untouched — so `npm update -g 9router`
+cannot wipe the fix.
 
 ```
-Any OpenAI-compatible client          muse CLI (Muse Code)
- (Hermes, Claude Code, curl, ...)          │
-            │                              ▼
-            │                     muse-gateway :20133   ← only for the Muse CLI
-            │                              │
-            └──────────────┬───────────────┘
-                           ▼
-                    9router :20127
-                           ▼
-                  muse-adapter :20132
-                           ▼
-                     api.meta.ai
+Any OpenAI-compatible client            Muse Code CLI
+ (Hermes, Claude Code, curl, app)      (muse exec)
+             │                              │
+             │                     muse-gateway :20133   ← CLI entry only
+             │                              │
+             └──────────────┬───────────────┘
+                            ▼
+                     9router :20127
+                            ▼
+                   muse-adapter :20132
+                            ▼
+                      api.meta.ai
 ```
 
-- **`muse-adapter` (:20132)** sits in front of `api.meta.ai` and is used by *everything* —
-  it is the layer that fixes Meta's attestation gate, tool arguments, and edge flakes.
-  9router's `muse` connection points here (`baseUrl = http://127.0.0.1:20132/v1`).
-- **`muse-gateway` (:20133)** is an *optional entry shim for the Muse Code CLI only*. Normal
-  clients (Hermes, Claude Code, curl, anything OpenAI-compatible) call 9router directly at
-  `:20127` and never touch it. The CLI needs it because it hardcodes its own Muse key and
-  polls `GET /muse-code/models` (outside `/v1`), which plain 9router does not serve.
+| Service | Port | Who uses it | Job |
+|---|---|---|---|
+| `muse-adapter` | 20132 | **everything** (sits behind 9router) | attestation fix, parameter normalisation, tool-argument repair, edge-flake handling |
+| `muse-gateway` | 20133 | Muse Code CLI only | rewrites the CLI's auth to the 9router key, serves `GET /muse-code/models` |
 
-Both are plain Python 3 stdlib, no dependencies, systemd-managed.
+Normal clients never touch the gateway — they call 9router directly and the adapter is already on
+the outbound path. Only the Muse Code CLI needs the extra hop, because it hardcodes its own key and
+polls an endpoint that 9router does not serve.
 
----
-
-## The problems this solves
-
-### 1. `403 client_attestation_denied` (muse-adapter)
-
-Meta refuses subscription keys sent by anything that is not the Muse Code client:
-
-```json
-{"error":{"code":"client_attestation_denied",
- "message":"This API key is billed to a Muse Code subscription. Muse Code subscriptions cover
- requests from the Muse Code client only. Use it in Muse Code, or use a pay-as-you-go API key."}}
-```
-
-The gate is **not** header-based and **not** User-Agent-based — those were tested and both pass.
-It fires when the Responses payload carries **flat function tools** at the top level:
-
-```json
-"tools": [{"type":"function","name":"read_file", ...}]     // ✗ 403
-"tools": [{"type":"namespace","name":"client","tools":[{"type":"function","name":"read_file"}]}]  // ✓ 200
-```
-
-Muse Code always wraps its tools in a `namespace` block, so anything else is classified as
-"not Muse Code". The adapter wraps flat tools into a namespace named `client` on the way out.
-Meta returns the tool name **without** the namespace prefix (`read_file`, not `client.read_file`),
-so no response rewriting is needed.
-
-Other normalisations the adapter does, because Meta rejects them outright:
-
-| Symptom | Upstream rule | Adapter fix |
-|---|---|---|
-| `400 max_output_tokens The number must be >= 16` | min 16 | clamp to `>= 16` |
-| `400 reasoning_effort` at root | must be `reasoning.effort` | move it |
-| `400 only "auto" is supported for tool_choice` | named/none choices rejected | drop unless `"auto"` |
-
-### 2. Tool calls arriving with empty arguments (`arguments: "{}"`)
-
-Symptom on the client: every tool call lands with no arguments — `read_file` gets an empty
-path, fails, the client retries the same call, and its loop guardrail kills the turn
-(`repeated_exact_failure_block` / `guardrail_halt`).
-
-Cause: Meta only keeps tool arguments correct when the history replays the assistant's tool
-call the way Muse Code does — the `reasoning` item (with `encrypted_content`) followed by the
-exact `function_call` item Meta returned. A chat→Responses gateway (9router) rebuilds history
-from chat `tool_calls`, so those items are lost and the model degenerates to `{}`.
-
-Measured on this chain (same prompt, 5 runs each):
-
-| History shape | Correct arguments |
-|---|---|
-| fabricated `function_call` (no reasoning item) | **0 / 5** |
-| Meta's own items replayed verbatim | **5 / 5** |
-
-Fix: the adapter caches every `function_call` it sees — together with the `reasoning` item
-that preceded it — in `call_cache.sqlite`, keyed by `call_id`, and re-injects both into later
-requests. It also asks for `include: ["reasoning.encrypted_content"]` so there is something to
-cache, and drops empty-argument calls it cannot restore (replaying `{}` teaches the model to
-keep emitting `{}`).
-
-Verified through the real chain after the fix: 4/4 two-turn runs correct, and a 5-file
-sequential tool session returned all five results.
-
-Cache notes: best-effort, bounded to 4000 entries, `/poki/tools/muse-adapter/call_cache.sqlite`.
-Deleting it is safe — the adapter simply starts relearning (and drops empty calls meanwhile).
-
-### 3. Upstream edge flakes
-
-api.meta.ai occasionally accepts a request, hangs ~300 s, then answers with a
-`<title>Facebook | Error</title>` HTML page. Relayed as-is, an API client chokes on HTML.
-The adapter caps the upstream at `MUSE_UPSTREAM_TIMEOUT` (default 180 s) and rewrites any HTML
-body (4xx/5xx and 200) into a clean JSON `upstream_timeout` / `upstream_edge_error`.
-
-### 4. Muse CLI cannot authenticate to 9router (muse-gateway)
-
-The CLI has two hardcoded assumptions a gateway cannot satisfy:
-
-* it authenticates with its own Muse key, which 9router rejects (`Invalid API key (requireApiKey=true)`);
-* it lists models from `GET /muse-code/models` — **outside** `/v1` — and treats the 404 as an auth failure
-  (`still unauthorized after a token refresh`).
-
-The gateway rewrites `Authorization` to the 9router key and serves `/muse-code/models` from
-9router's `/v1/models`.
-
----
-
-## Install
+## Quickstart
 
 ```bash
-bash /poki/tools/muse-adapter/install.sh
+# 1. install both services + point 9router's muse connection at the adapter
+bash install.sh
+
+# 2. verify every layer
+bash scripts/selftest.sh
+
+# 3. use it from the Muse Code CLI
+muse exec --base-url http://127.0.0.1:20133/v1 \
+          --model <9router-combo> --contributor-mode on \
+          --workspace /path/to/repo 'your prompt'
 ```
 
-What it does:
+## What it fixes
 
-1. writes the 9router API key to `/poki/tools/muse-adapter/9router.key` (mode 600)
-2. installs and starts `muse-adapter.service` (`:20132`) and `muse-gateway.service` (`:20133`)
-3. points the 9router `muse` connection's `baseUrl` at `http://127.0.0.1:20132/v1`
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 1 | `403 client_attestation_denied` | Meta only accepts payloads whose `tools` are wrapped in a `namespace` block, the way Muse Code sends them | wrap flat tools into `{"type":"namespace","name":"client",...}` |
+| 2 | `400 max_output_tokens must be >= 16` | Meta enforces a floor | clamp |
+| 3 | `400 unknown parameter reasoning_effort` | Meta wants `reasoning.effort` | move it |
+| 4 | `400 only "auto" is supported for tool_choice` | Meta rejects named/none choices | drop unless `auto` |
+| 5 | tool calls arrive with `arguments: "{}"` → client loop guardrail kills the turn | Meta needs its own `reasoning` + `function_call` items replayed in history; a chat→Responses gateway cannot rebuild them | cache Meta's items per `call_id` and re-inject them |
+| 6 | CLI: `still unauthorized after a token refresh` | CLI reads `GET /muse-code/models`, which 9router does not serve | gateway serves it from `/v1/models` |
+| 7 | ~300 s hang, then a `Facebook \| Error` HTML page | api.meta.ai edge flake | 180 s cap + HTML→JSON rewrite |
 
-> The 9router connection **must** point at the adapter (`:20132`), not directly at `api.meta.ai`,
-> otherwise the 403 returns.
+Details and measurements: [docs/how-it-works.md](docs/how-it-works.md).
 
-## Use
+## Docs
 
-### Normal clients (Hermes, [CC], curl, any [OI]-compatible app)
+- **[docs/how-it-works.md](docs/how-it-works.md)** — request lifecycle, every transformation with
+  before/after payloads, SSE relay, the tool-call cache, why the gate falls, what breaks it.
+- **[docs/install.md](docs/install.md)** — prerequisites, manual step-by-step install (no script),
+  9router provider setup (UI and SQL), configuration reference, verification, upgrade, uninstall,
+  Docker notes.
+- **[docs/troubleshooting.md](docs/troubleshooting.md)** — error string → cause → fix.
+- **[docs/quickstart.vi.md](docs/quickstart.vi.md)** — bản tóm tắt tiếng Việt.
 
-Nothing to do — call 9router directly. The adapter is already behind it.
+## Layout
 
-```bash
-curl http://127.0.0.1:20127/v1/chat/completions \
-  -H "Authorization: Bearer $(cat /poki/tools/muse-adapter/9router.key)" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"thtung-muse","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+```
+adapter.py              reverse proxy in front of api.meta.ai (the actual fix)
+muse_gateway.py         entry shim for the Muse Code CLI only
+install.sh              installs both units, writes the key, repoints 9router
+scripts/selftest.sh     walks every layer and reports the failing one
+config.env.example      every knob, documented
+docs/                   mechanism, install, troubleshooting, Vietnamese quickstart
 ```
 
-### Muse Code CLI
+`install.sh` honours `INSTALL_DIR`, `DB`, `ADAPTER_PORT`, `GATEWAY_PORT`, `ADAPTER_URL`,
+`UNIT_DIR`, `SKIP_RESTART` — see the header of the script.
 
-The CLI must enter through the gateway, not 9router directly.
+## Requirements
 
-```bash
-muse exec \
-  --base-url http://127.0.0.1:20133/v1 \
-  --model thtung-muse \
-  --contributor-mode on \
-  --reasoning-effort low \
-  --workspace /path/to/repo \
-  'your prompt'
-```
+- Python 3.8+ (stdlib only — no pip installs)
+- systemd (units are provided; anything that can run two long-lived processes works too)
+- 9router reachable on `127.0.0.1:20127` (or set `MUSE_GW_UPSTREAM`)
+- A Muse Code subscription key (`LLM|…`, from `~/.config/muse/auth.json`)
 
-Notes:
+## Limits — read before relying on it
 
-* `--model` must be the **9router** model id (the combo, e.g. `thtung-muse`). Passing the raw
-  upstream id (`muse-spark-1.3-contributor`) fails with `model muse-spark-1.3 does not exist`,
-  because the CLI normalises the name.
-* `--contributor-mode on` sends `x-tbh-contributor-mode: 1`; without it the CLI strips the
-  `-contributor` suffix from the model id.
-* Any OpenAI-compatible client can call `http://<host>:20127/v1` with the 9router key directly —
-  the adapter is transparent for them too.
+This works because Meta's gate **inspects payload shape**, not client identity: no signature, no
+attestation token. We proved that by bisecting headers and body fields (see how-it-works §6). If
+Meta ever moves to a real per-client signature, this approach breaks and the adapter must be
+revisited — it is not a cryptographic bypass.
 
-## Verify
+Also:
 
-```bash
-systemctl is-active muse-adapter muse-gateway 9router
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:20133/muse-code/models   # 200
-curl -s http://127.0.0.1:20127/v1/chat/completions \
-  -H "Authorization: Bearer $(cat /poki/tools/muse-adapter/9router.key)" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"thtung-muse","messages":[{"role":"user","content":"say OK"}],"max_tokens":64}'
-```
+- the tool-call cache is per-host state (`call_cache.sqlite`); a call made before the cache existed
+  cannot be repaired, only dropped (a fresh session fixes it)
+- `namespace`-wrapped tools change the tool *names* Meta sees; the adapter strips the prefix on the
+  way back, so clients keep their own names
+- it proxies `POST /v1/responses`, `POST /v1/chat/completions` and `GET` passthrough only
 
-Logs: `journalctl -u muse-adapter -f`, `journalctl -u muse-gateway -f`, plus
-`/poki/tools/muse-adapter/{adapter,gateway}.log`.
+## Security
 
-## Failure modes seen in the field
-
-* **`still unauthorized after a token refresh`** — the CLI hit `/muse-code/models` and got 404.
-  Means `--base-url` points at 9router directly instead of the gateway (`:20133`).
-* **`Invalid API key (requireApiKey=true)` in 9router log** — the gateway is forwarding the Muse
-  key instead of the 9router key; check `9router.key` exists and is the full 35-char key.
-* **`client_attestation_denied` again** — something bypassed the adapter. Check the connection's
-  `baseUrl` is `http://127.0.0.1:20132/v1`.
-* **`model muse-spark-1.3 does not exist`** — `--model` was the upstream id, not the 9router id.
-* **Client guardrail fires on a tool call (`repeated_exact_failure_block`)** — the tool arrived
-  with `arguments: "{}"`. Check `grep -c replayed adapter.log`: if it is 0, the call history was
-  rebuilt outside the cache (e.g. session older than the cache). Start a fresh session; new calls
-  are cached automatically.
-* **`Duplicate item with id rs_...`** — a reasoning item was replayed twice. The adapter dedupes
-  against ids already present in the input; if it recurs, delete `call_cache.sqlite` to reset.
-
-## Why sidecars instead of patching 9router
-
-Patches to `/usr/local/lib/node_modules/9router/app/.next-cli-build/server/chunks/*.js` are wiped
-by `npm update -g 9router` or any container rebuild. Both shims live in `/poki/tools/` and are
-independent of 9router's release cycle.
+- the 9router API key lives in `9router.key` (mode 600) — never commit it
+- both services bind `127.0.0.1` by default; do not expose `:20132` publicly, it forwards your
+  subscription key upstream
+- `MUSE_DUMP_DIR` writes full request bodies to disk when set — debugging only, leave it unset

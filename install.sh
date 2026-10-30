@@ -1,61 +1,85 @@
 #!/usr/bin/env bash
-# Install the Muse Code <-> 9router bridge (adapter + gateway) and point 9router at the adapter.
+# Install the Muse Code <-> 9router bridge.
+#
+#   bash install.sh              # full install
+#   SKIP_RESTART=1 bash install.sh   # do not restart 9router
+#
+# Override anything via env:
+#   INSTALL_DIR=/opt/muse-bridge
+#   DB=/root/ai-services/data-9router/db/data.sqlite
+#   ADAPTER_PORT=20132  GATEWAY_PORT=20133
+#   ADAPTER_URL=http://127.0.0.1:20132/v1     # what 9router should point at
 set -euo pipefail
 
-DIR=/poki/tools/muse-adapter
-DB=/root/ai-services/data-9router/db/data.sqlite
-UNIT_DIR=/etc/systemd/system
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${INSTALL_DIR:-$HERE}"
+DB="${DB:-/root/ai-services/data-9router/db/data.sqlite}"
+ADAPTER_PORT="${ADAPTER_PORT:-20132}"
+GATEWAY_PORT="${GATEWAY_PORT:-20133}"
+ADAPTER_URL="${ADAPTER_URL:-http://127.0.0.1:$ADAPTER_PORT/v1}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+SKIP_RESTART="${SKIP_RESTART:-0}"
 
-echo "==> writing 9router API key"
-python3 - <<'PY'
-import os, sqlite3
-c = sqlite3.connect("/root/ai-services/data-9router/db/data.sqlite")
+say() { printf '==> %s\n' "$*"; }
+
+say "install dir: $INSTALL_DIR"
+say "9router db:  $DB"
+say "adapter:     :$ADAPTER_PORT  (9router will point at $ADAPTER_URL)"
+say "gateway:     :$GATEWAY_PORT  (Muse Code CLI entry)"
+
+[ -f "$DB" ] || { echo "ERROR: 9router DB not found at $DB (set DB=...)"; exit 1; }
+command -v python3 >/dev/null || { echo "ERROR: python3 required"; exit 1; }
+
+say "writing the 9router API key"
+python3 - "$DB" "$INSTALL_DIR/9router.key" <<'PY'
+import os, sqlite3, sys
+db, out = sys.argv[1], sys.argv[2]
+c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
 row = c.execute("SELECT key FROM apiKeys WHERE isActive=1 ORDER BY createdAt LIMIT 1").fetchone()
 if not row:
-    raise SystemExit("no active 9router API key found")
-k = row[0]
-p = "/poki/tools/muse-adapter/9router.key"
-with open(p, "w") as f:
-    f.write(k + "\n")
-os.chmod(p, 0o600)
-print("    key written (%d chars)" % len(k))
+    sys.exit("ERROR: no active 9router API key — create one in the dashboard")
+key = row[0]
+if len(key) < 30:
+    sys.exit("ERROR: key looks truncated (%d chars)" % len(key))
+with open(out, "w") as f:
+    f.write(key + "\n")
+os.chmod(out, 0o600)
+print("    key written (%d chars) -> %s" % (len(key), out))
 PY
 
-echo "==> installing systemd units"
-cat > "$UNIT_DIR/muse-adapter.service" <<'UNIT'
+say "installing systemd units"
+cat > "$UNIT_DIR/muse-adapter.service" <<UNIT
 [Unit]
-Description=Muse Adapter — 9router -> api.meta.ai attestation shim
+Description=Muse adapter - 9router -> api.meta.ai
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /poki/tools/muse-adapter/adapter.py --host 127.0.0.1 --port 20132
+ExecStart=/usr/bin/python3 $INSTALL_DIR/adapter.py --host 127.0.0.1 --port $ADAPTER_PORT
 Restart=always
 RestartSec=3
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=muse-adapter
+Environment=MUSE_CALL_CACHE=$INSTALL_DIR/call_cache.sqlite
+Environment=MUSE_ADAPTER_LOG=$INSTALL_DIR/adapter.log
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-cat > "$UNIT_DIR/muse-gateway.service" <<'UNIT'
+cat > "$UNIT_DIR/muse-gateway.service" <<UNIT
 [Unit]
-Description=Muse Gateway — Muse Code CLI -> 9router shim
+Description=Muse gateway - Muse Code CLI -> 9router
 After=network-online.target 9router.service
 Wants=network-online.target
-Requires=9router.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /poki/tools/muse-adapter/muse_gateway.py --host 127.0.0.1 --port 20133
+ExecStart=/usr/bin/python3 $INSTALL_DIR/muse_gateway.py --host 127.0.0.1 --port $GATEWAY_PORT
 Restart=always
 RestartSec=3
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=muse-gateway
+Environment=MUSE_GW_UPSTREAM=http://127.0.0.1:20127
+Environment=MUSE_GW_KEY_FILE=$INSTALL_DIR/9router.key
+Environment=MUSE_GW_LOG=$INSTALL_DIR/gateway.log
 
 [Install]
 WantedBy=multi-user.target
@@ -64,39 +88,47 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now muse-adapter muse-gateway
 
-echo "==> pointing 9router muse connection at the adapter"
-python3 - <<'PY'
-import json, sqlite3
-db = "/root/ai-services/data-9router/db/data.sqlite"
+say "pointing the 9router Muse connection at the adapter"
+python3 - "$DB" "$ADAPTER_URL" <<'PY'
+import json, sqlite3, sys
+db, adapter_url = sys.argv[1], sys.argv[2]
 c = sqlite3.connect(db)
-rows = c.execute("SELECT id, data FROM providerConnections").fetchall()
 n = 0
-for cid, raw in rows:
+for cid, raw in c.execute("SELECT id, data FROM providerConnections").fetchall():
     d = json.loads(raw)
     psd = d.get("providerSpecificData") or {}
-    if "meta.ai" in (psd.get("baseUrl") or ""):
-        psd["baseUrl"] = "http://127.0.0.1:20132/v1"
-        d["providerSpecificData"] = psd
-        for k in [k for k in d if k.startswith("modelLock_")]:
-            d.pop(k, None)
-        for k in ("lastError", "errorCode", "lastErrorAt"):
-            d.pop(k, None)
-        d["testStatus"] = "active"
-        c.execute("UPDATE providerConnections SET data=? WHERE id=?", (json.dumps(d), cid))
-        n += 1
+    base = psd.get("baseUrl") or ""
+    if "meta.ai" not in base and ":" + adapter_url.rsplit(":", 1)[-1] not in base:
+        continue
+    psd["baseUrl"] = adapter_url
+    psd.setdefault("apiType", "responses")
+    d["providerSpecificData"] = psd
+    for k in [k for k in d if k.startswith("modelLock_")]:
+        d.pop(k, None)
+    for k in ("lastError", "errorCode", "lastErrorAt"):
+        d.pop(k, None)
+    d["testStatus"] = "active"
+    c.execute("UPDATE providerConnections SET data=? WHERE id=?", (json.dumps(d), cid))
+    n += 1
 c.commit()
-print("    repointed %d connection(s)" % n)
+if n == 0:
+    print("    WARNING: no Muse connection found — add one (docs/install.md section 4)")
+else:
+    print("    repointed %d connection(s) -> %s" % (n, adapter_url))
 PY
 
-if [ "${SKIP_RESTART:-0}" = "1" ]; then
-  echo "==> skipping 9router restart (SKIP_RESTART=1)"
+if [ "$SKIP_RESTART" = "1" ]; then
+  say "skipping 9router restart (SKIP_RESTART=1) — restart it yourself"
 else
+  say "restarting 9router"
   systemctl restart 9router
   sleep 3
 fi
 
-echo "==> health"
-systemctl is-active muse-adapter muse-gateway 9router
+say "health"
+systemctl is-active muse-adapter muse-gateway 9router || true
 printf 'muse-code/models: '
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:20133/muse-code/models
-echo "done"
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$GATEWAY_PORT/muse-code/models" || true
+
+echo
+echo "Next: bash $INSTALL_DIR/scripts/selftest.sh"
