@@ -88,6 +88,35 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now muse-adapter muse-gateway
 
+say "installing cache normalizer timer (dashboard cache display)"
+cat > "$UNIT_DIR/normalize-cache.service" <<UNIT
+[Unit]
+Description=Normalize nested prompt-cache counters in 9router requestDetails
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $INSTALL_DIR/scripts/normalize-cache.py --db $DB --apply
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UNIT
+
+cat > "$UNIT_DIR/normalize-cache.timer" <<UNIT
+[Unit]
+Description=Normalize 9router cache counters every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now normalize-cache.timer
+
 say "pointing the 9router Muse connection at the adapter"
 python3 - "$DB" "$ADAPTER_URL" <<'PY'
 import json, sqlite3, sys
@@ -127,6 +156,7 @@ fi
 
 say "health"
 systemctl is-active muse-adapter muse-gateway 9router || true
+systemctl is-enabled normalize-cache.timer || true
 printf 'muse-code/models: '
 curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$GATEWAY_PORT/muse-code/models" || true
 
