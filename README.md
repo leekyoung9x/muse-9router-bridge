@@ -78,6 +78,8 @@ adapter.py              reverse proxy in front of api.meta.ai (the actual fix)
 muse_gateway.py         entry shim for the Muse Code CLI only
 install.sh              installs both units, writes the key, repoints 9router
 scripts/selftest.sh     walks every layer and reports the failing one
+scripts/normalize-cache.py  backfills nested Meta cache counters to top-level
+                        cached_tokens so /dashboard/usage shows Muse hits
 config.env.example      every knob, documented
 docs/                   mechanism, install, troubleshooting, Vietnamese quickstart
 ```
