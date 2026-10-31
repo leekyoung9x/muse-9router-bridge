@@ -233,6 +233,32 @@ call_cache.sqlite
 Deleting the file is safe — the adapter relearns from new responses and drops unrecoverable calls
 in the meantime. Sessions that started before the cache existed need a fresh start to benefit.
 
+Entries older than `MUSE_REPLAY_MAX_AGE` (default 45 min) are not replayed: Meta expires
+reasoning `encrypted_content`, and replaying dead chain links breaks the continuity follow-up
+calls need. Skipped replays are logged as `skipped N stale replay(s)`.
+
+### 5b. Per-session prompt-cache slots
+
+9router forwards no `prompt_cache_key` on either path (verified on live dumps: always `None`),
+so every session shares Meta's default cache slot. Concurrent sessions with distinct 100–300k
+prefixes then evict each other and identical prefixes alternate hit/miss seconds apart —
+measured as 28–40% hit rate on a busy morning vs 93–100% overnight.
+
+When enabled (`MUSE_SESSION_KEY=1`, default), the adapter derives a stable key per session —
+`tbh:adp:<sha1(model | instructions | tools | first-input-item)>` — the same namespacing idea
+as Muse Code's own `tbh:main:<session-id>`. The first input item never changes within a session
+(first Discord message / first system-reminder) but differs across sessions, so each conversation
+gets its own slot without needing a session id that 9router does not forward. Logged as
+`session-key tbh:adp:…` on every request line. Set `MUSE_SESSION_KEY=0` to leave the field alone.
+
+Note the honest limits, all measured live:
+- a key alone does not create cache: identical 2–16k-token repeats with and without a key both
+  report 0 — Meta only engages the cache on large stable prefixes;
+- brand-new sessions always miss the first 1–2 turns (cold prefix), and a compaction/session
+  restart wipes the prefix entirely — the next turns rewarm from zero;
+- the dashboard Usage page cannot display cache at all (`usageHistory` has no cache column);
+  read hit rate from `requestDetails.tokens` or the `CACHE ↻N` marker on `DONE` lines instead.
+
 ## 6. Why the attestation gate falls
 
 The gate is **payload shape**, not identity. Evidence from live bisection:

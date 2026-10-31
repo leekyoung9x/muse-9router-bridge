@@ -47,6 +47,15 @@ MUSE_UA = os.environ.get(
 LOG_PATH = os.environ.get("MUSE_ADAPTER_LOG", "/poki/tools/muse-adapter/adapter.log")
 DUMP_DIR = os.environ.get("MUSE_DUMP_DIR", "")  # set to a dir to capture request/response bodies
 CACHE_PATH = os.environ.get("MUSE_CALL_CACHE", "/poki/tools/muse-adapter/call_cache.sqlite")
+# Per-session prompt_cache_key: 9router never forwards one (both paths show None),
+# so every session shares Meta's default cache slot and concurrent sessions evict
+# each other -> hit/miss flapping on identical prefixes. A stable key per session
+# gives each conversation its own slot, the way Muse Code's tbh:main:<session> does.
+SESSION_KEY = os.environ.get("MUSE_SESSION_KEY", "1") == "1"
+# Tool-call replay age cap: Meta expires reasoning encrypted_content, and replaying
+# dead chain links breaks the continuity Meta needs for follow-up calls. Entries
+# older than this (seconds) are not replayed.
+REPLAY_MAX_AGE = int(os.environ.get("MUSE_REPLAY_MAX_AGE", "2700"))
 MIN_MAX_OUTPUT_TOKENS = 16
 # Meta's edge occasionally accepts a request then never answers; 300s of silence is
 # already far past any useful client budget, so fail fast with a clean JSON 504.
@@ -119,9 +128,16 @@ def transform_request_body(raw):
 
     # Replay Meta's own tool-call items so the model keeps emitting real arguments.
     if isinstance(body.get("input"), list):
-        body["input"], restored = replay_history(body["input"])
+        body["input"], restored, stale = replay_history(body["input"])
         if restored:
             notes.append("replayed %d tool-call(s)" % restored)
+        if stale:
+            notes.append("skipped %d stale replay(s)" % stale)
+
+    # Per-session cache slot (Muse sends tbh:main:<session>; 9router forwards none).
+    if SESSION_KEY and not body.get("prompt_cache_key"):
+        body["prompt_cache_key"] = session_cache_key(body)
+        notes.append("session-key %s" % body["prompt_cache_key"])
 
     # Ask for the encrypted reasoning payloads we need in order to replay them later.
     inc = body.get("include")
@@ -341,13 +357,39 @@ def cache_put(entries):
 
 
 def cache_get(call_id):
+    """Return (payload, age_seconds) or (None, None)."""
     try:
         conn = _cache_conn()
-        row = conn.execute("SELECT payload FROM calls WHERE call_id=?", (call_id,)).fetchone()
+        row = conn.execute("SELECT payload, ts FROM calls WHERE call_id=?", (call_id,)).fetchone()
         conn.close()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None, None
+        try:
+            age = time.time() - float(row[1])
+        except (ValueError, TypeError):
+            age = 0
+        return json.loads(row[0]), age
     except Exception:  # noqa: BLE001
-        return None
+        return None, None
+
+
+def session_cache_key(body):
+    """Stable per-session prompt_cache_key derived from session-anchored content.
+
+    The first input item never changes within a session (first Discord message /
+    first system-reminder) but differs across sessions, so its hash isolates each
+    conversation into its own Meta cache slot without needing a session id that
+    9router does not forward.
+    """
+    import hashlib
+    h = hashlib.sha1()
+    h.update(str(body.get("model") or "").encode())
+    h.update(str(body.get("instructions") or "")[:4000].encode())
+    h.update(json.dumps(body.get("tools"), sort_keys=True, ensure_ascii=False)[:8000].encode())
+    inp = body.get("input") or []
+    if inp:
+        h.update(json.dumps(inp[0], sort_keys=True, ensure_ascii=False)[:4000].encode())
+    return "tbh:adp:" + h.hexdigest()[:16]
 
 
 def replay_history(items):
@@ -358,13 +400,18 @@ def replay_history(items):
     emitting empty calls, which is exactly the failure this module exists to stop.
     """
     if not isinstance(items, list):
-        return items, 0
+        return items, 0, 0
     existing = {it.get("id") for it in items if isinstance(it, dict) and it.get("id")}
     out, seen, restored, dropped = [], set(), 0, set()
+    stale = 0
     for it in items:
         if isinstance(it, dict) and it.get("type") == "function_call":
             cid = it.get("call_id") or ""
-            hit = cache_get(cid)
+            hit, age = cache_get(cid)
+            if hit and age is not None and age > REPLAY_MAX_AGE:
+                stale += 1
+                hit = None  # encrypted_content likely expired; replaying it
+                            # breaks the chain Meta needs for follow-up calls
             if hit and hit.get("function_call"):
                 fc = hit["function_call"]
                 reas = hit.get("reasoning")
@@ -392,7 +439,7 @@ def replay_history(items):
         if isinstance(it, dict) and it.get("id") in seen:
             continue  # already replayed verbatim
         out.append(it)
-    return out, restored
+    return out, restored, stale
 
 
 class Handler(BaseHTTPRequestHandler):
