@@ -5,6 +5,7 @@
 
 : "${ADAPTER_PORT:=20132}"
 : "${GATEWAY_PORT:=20133}"
+: "${CLAUDE_ADAPTER_PORT:=20129}"
 : "${ROUTER_URL:=http://127.0.0.1:20127}"
 : "${MUSE_MODEL:=muse-spark-1.3-contributor}"
 : "${ROUTER_MODEL:=thtung-muse}"
@@ -18,12 +19,12 @@ info() { printf '  ---- %s\n' "$*"; }
 
 FAILED=0
 echo "== 1. services =="
-for u in muse-adapter muse-gateway; do
+for u in muse-adapter muse-gateway claude-adapter; do
   if systemctl is-active --quiet "$u" 2>/dev/null; then pass "$u active"; else fail "$u not active"; fi
 done
 
 echo "== 2. ports =="
-for p in "$ADAPTER_PORT" "$GATEWAY_PORT"; do
+for p in "$ADAPTER_PORT" "$GATEWAY_PORT" "$CLAUDE_ADAPTER_PORT"; do
   if ss -ltn 2>/dev/null | grep -q ":$p "; then pass "port $p listening"; else fail "port $p not listening"; fi
 done
 
@@ -67,7 +68,7 @@ except urllib.error.HTTPError as e:
 PY
 [ $? -ne 0 ] && FAILED=1
 
-echo "== 5. 9router connection points at the adapter =="
+echo "== 5. 9router Muse connection points at the adapter =="
 python3 - <<'PY'
 import json, sqlite3, sys
 db = "/root/ai-services/data-9router/db/data.sqlite"
@@ -133,6 +134,38 @@ if [ -f "$CACHE_DB" ]; then
 else
   info "no cache file yet — normal on a fresh install"
 fi
+
+echo "== 9. claude-adapter reachable (expect 401 = upstream reached, not 400) =="
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST "http://127.0.0.1:$CLAUDE_ADAPTER_PORT/v1/messages" \
+        -H 'Content-Type: application/json' -d '{}' || true)
+case "$code" in
+  401|400|200) pass "claude-adapter reachable (HTTP $code)" ;;
+  *)           fail "claude-adapter unreachable (HTTP $code)" ;;
+esac
+
+echo "== 10. 9router Anthropic connection points at the claude adapter =="
+python3 - <<'PY'
+import json, sqlite3, sys
+db = "/root/ai-services/data-9router/db/data.sqlite"
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+except Exception as e:
+    print("  \033[31mFAIL\033[0m cannot open %s: %s" % (db, e)); sys.exit(1)
+found = []
+for cid, raw in c.execute("SELECT id, data FROM providerConnections"):
+    d = json.loads(raw)
+    b = (d.get("providerSpecificData") or {}).get("baseUrl", "")
+    if "anthropic.com" in b or "20129" in b:
+        found.append(b)
+if not found:
+    print("  \033[33mWARN\033[0m no Anthropic connection found — add one in 9router, then re-run install.sh")
+    sys.exit(0)
+bad = [b for b in found if "20129" not in b]
+if bad:
+    print("  \033[31mFAIL\033[0m connection still points at %s" % bad[0]); sys.exit(1)
+print("  \033[32mPASS\033[0m connection -> %s" % found[0])
+PY
+[ $? -ne 0 ] && FAILED=1
 
 echo
 if [ "$FAILED" -eq 0 ]; then

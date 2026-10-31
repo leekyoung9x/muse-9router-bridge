@@ -17,16 +17,18 @@ Any OpenAI-compatible client            Muse Code CLI
              └──────────────┬───────────────┘
                             ▼
                      9router :20127
-                            ▼
-                   muse-adapter :20132
-                            ▼
-                      api.meta.ai
+                      ┌──────┴──────┐
+                      ▼             ▼
+           muse-adapter :20132   claude-adapter :20129
+                      ▼             ▼
+                 api.meta.ai   api.anthropic.com
 ```
 
 | Service | Port | Who uses it | Job |
 |---|---|---|---|
-| `muse-adapter` | 20132 | **everything** (sits behind 9router) | attestation fix, parameter normalisation, tool-argument repair, edge-flake handling |
+| `muse-adapter` | 20132 | **everything Muse** (sits behind 9router) | attestation fix, parameter normalisation, tool-argument repair, edge-flake handling |
 | `muse-gateway` | 20133 | Muse Code CLI only | rewrites the CLI's auth to the 9router key, serves `GET /muse-code/models` |
+| `claude-adapter` | 20129 | **everything Anthropic-key** (sits behind 9router) | strips Claude Code markers (CC betas, `x-app`/`x-claude-code-*`, CC system prompt, `Bearer` auth, `?beta=`) that 9router's old build forwards and that make API-key requests fail with "credit balance too low" |
 
 Normal clients never touch the gateway — they call 9router directly and the adapter is already on
 the outbound path. Only the Muse Code CLI needs the extra hop, because it hardcodes its own key and
@@ -35,7 +37,7 @@ polls an endpoint that 9router does not serve.
 ## Quickstart
 
 ```bash
-# 1. install both services + point 9router's muse connection at the adapter
+# 1. install all services + point 9router's connections at the adapters
 bash install.sh
 
 # 2. verify every layer
@@ -58,6 +60,7 @@ muse exec --base-url http://127.0.0.1:20133/v1 \
 | 5 | tool calls arrive with `arguments: "{}"` → client loop guardrail kills the turn | Meta needs its own `reasoning` + `function_call` items replayed in history; a chat→Responses gateway cannot rebuild them | cache Meta's items per `call_id` and re-inject them |
 | 6 | CLI: `still unauthorized after a token refresh` | CLI reads `GET /muse-code/models`, which 9router does not serve | gateway serves it from `/v1/models` |
 | 7 | ~300 s hang, then a `Facebook \| Error` HTML page | api.meta.ai edge flake | 180 s cap + HTML→JSON rewrite |
+| 8 | Claude via 9router: `400 Your credit balance is too low` on an API key with credit | 9router's old build forwards Claude Code markers (`claude-code-20250219` / `oauth-2025-04-20` betas, `x-app` / `x-claude-code-*` headers, the CC system prompt, `Bearer` auth) that Anthropic only accepts from real Claude Code OAuth traffic | `claude-adapter :20129` strips them in flight (see `docs/claude.md`) |
 
 Details and measurements: [docs/how-it-works.md](docs/how-it-works.md).
 
