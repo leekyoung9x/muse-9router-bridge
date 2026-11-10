@@ -4,3 +4,6 @@ call_cache.sqlite
 *.log
 __pycache__/
 *.pyc
+stateful.sqlite
+stateful.allow
+checkpoints/

@@ -114,9 +114,20 @@ def transform_request_body(raw):
 
     eff = body.pop("reasoning_effort", None)
     if eff is not None:
+        # 9router forwards reasoning-off as 'none'; Meta has no such level.
+        # Supported: minimal, low, medium, high, xhigh, max.
+        # Policy for Muse: default it to medium.
+        if isinstance(eff, str) and eff.strip().lower() in ("none", "disable", "disabled", "off"):
+            notes.append("reasoning_effort %r->medium" % (eff,))
+            eff = "medium"
         cur = body.get("reasoning")
         if isinstance(cur, dict):
-            cur.setdefault("effort", eff)
+            reff = cur.get("effort")
+            if isinstance(reff, str) and reff.strip().lower() in ("none", "disable", "disabled", "off"):
+                notes.append("reasoning.effort %r->medium" % (reff,))
+                cur["effort"] = "medium"
+            else:
+                cur.setdefault("effort", eff)
         else:
             body["reasoning"] = {"effort": eff}
         notes.append("reasoning_effort->reasoning.effort(%s)" % eff)
@@ -127,19 +138,47 @@ def transform_request_body(raw):
         notes.append("max_output_tokens %d->%d" % (mot, MIN_MAX_OUTPUT_TOKENS))
 
     # Replay Meta's own tool-call items so the model keeps emitting real arguments.
+    # Skipped when stateful-chained: history lives server-side, re-adding old
+    # items would duplicate them next to previous_response_id.
+    sf_mode = "stateless"
     if isinstance(body.get("input"), list):
-        body["input"], restored, stale = replay_history(body["input"])
-        if restored:
-            notes.append("replayed %d tool-call(s)" % restored)
-        if stale:
-            notes.append("skipped %d stale replay(s)" % stale)
+        _sk0 = body.get("prompt_cache_key") or \
+            (session_cache_key(body) if SESSION_KEY else None)
+        if _sk0 and not body.get("prompt_cache_key"):
+            body["prompt_cache_key"] = _sk0
+            notes.append("session-key %s" % _sk0)
+        _chain = False
+        if _sk0:
+            try:
+                import stateful as _sf0
+                if _sf0.decide(_sk0):
+                    _notes0, sf_mode = _sf0.apply(body, _sk0)
+                    notes.extend(_notes0)
+                    _chain = (sf_mode == "chained")
+            except Exception as e:  # noqa: BLE001
+                notes.append("stateful err %s" % e)
+        if _chain:
+            notes.append("replay skipped (stateful chained)")
+        else:
+            body["input"], restored, stale = replay_history(body["input"])
+            if restored:
+                notes.append("replayed %d tool-call(s)" % restored)
+            if stale:
+                notes.append("skipped %d stale replay(s)" % stale)
 
     # Per-session cache slot (Muse sends tbh:main:<session>; 9router forwards none).
+    # Computed BEFORE stateful mutation: chaining replaces input with new items
+    # only, which would otherwise change inp[0] and destabilise the slot + key.
     if SESSION_KEY and not body.get("prompt_cache_key"):
         body["prompt_cache_key"] = session_cache_key(body)
         notes.append("session-key %s" % body["prompt_cache_key"])
 
     # Ask for the encrypted reasoning payloads we need in order to replay them later.
+    # Exception: Meta rejects `include: reasoning.encrypted_content` together with
+    # `previous_response_id` (stateful chain keeps server-side history instead).
+    if body.get("previous_response_id"):
+        notes.append("stateful previous_response_id, skipping encrypted_content include")
+        return json.dumps(body).encode(), notes
     inc = body.get("include")
     if not isinstance(inc, list):
         inc = []
@@ -176,6 +215,7 @@ class StreamPatcher:
         self.items = []     # completed output items, in order
         self.patched = 0
         self.saved = 0
+        self.response_id = None  # captured from response.created/completed
 
     # ---------- accumulation ----------
 
@@ -248,6 +288,11 @@ class StreamPatcher:
         self._remember(d)
 
         t = d.get("type") or self.event
+        if t in ("response.created", "response.completed", "response.done",
+                 "response.incomplete"):
+            r = d.get("response") or {}
+            if isinstance(r, dict) and str(r.get("id", "")).startswith("resp_"):
+                self.response_id = r["id"]
         if t == "response.output_item.done":
             item = d.get("item") or {}
             if isinstance(item, dict) and item.get("type"):
@@ -505,7 +550,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
-    def _relay_stream(self, resp):
+    def _relay_stream(self, resp, sk_hint=None, managed=False):
         self.send_response(resp.status)
         self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
         self.send_header("Cache-Control", "no-cache")
@@ -522,6 +567,15 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if patcher.patched:
                 log("  repaired %d empty function_call arguments" % patcher.patched)
+            if managed and sk_hint and patcher.response_id:
+                try:
+                    import stateful as _sf
+                    # Only advance chains the adapter manages (it injected store/
+                    # previous_response_id). Client-driven chains stay untouched.
+                    if _sf.decide(sk_hint) and _sf.record(sk_hint, patcher.response_id):
+                        log("  stateful %s chain -> %s" % (sk_hint[8:16], patcher.response_id[:14] + "..."))
+                except Exception:
+                    pass
             try:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
@@ -535,13 +589,32 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._read_body()
         notes = []
         body = raw
+        model = "-"
         if "/responses" in self.path or "/chat/completions" in self.path:
+            try:
+                model = json.loads(raw).get("model", "-")
+            except ValueError:
+                pass
             body, notes = transform_request_body(raw)
 
         resp = self._open("POST", body)
         status = getattr(resp, "status", getattr(resp, "code", 0))
         ctype = resp.headers.get("Content-Type", "")
         dump("req", body)
+
+        # Stateful hint: session key for chain capture / recovery. The chain is
+        # adapter-managed only when the client did not drive previous_response_id.
+        sk_hint, sf_managed = None, False
+        try:
+            import stateful as _sf0
+            if _sf0.enabled() and SESSION_KEY:
+                _b0 = json.loads(body)  # transformed body: key must match transform's
+                if isinstance(_b0, dict):
+                    sk_hint = _b0.get("prompt_cache_key")
+                    sf_managed = b"previous_response_id" not in raw and \
+                        bool(sk_hint) and _sf0.decide(sk_hint)
+        except (ValueError, TypeError):
+            pass
 
         if status >= 400:
             payload = resp.read()
@@ -553,24 +626,64 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "server_error"}}).encode()
                 ctype = "application/json"
             preview = payload[:300].decode("utf-8", "ignore").replace("\n", " ")
-            log("POST %s -> %s %dms %s | %s" % (self.path, status, (time.time() - started) * 1000,
-                                                ",".join(notes), preview))
-            out = unwrap_names(payload.decode("utf-8", "ignore")).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", ctype or "application/json")
-            self.send_header("Content-Length", str(len(out)))
-            self.end_headers()
-            self.wfile.write(out)
-            return
+            # Stateful recovery: our injected previous_response_id died (expired /
+            # unknown). Drop the chain and retry ONCE as a fresh bootstrap with
+            # the client's full original history — the next turn chains again.
+            if sf_managed:
+                try:
+                    import stateful as _sf1
+                    if _sf1.is_rid_error(preview):
+                        _sf1.clear(sk_hint)
+                        body2, notes2 = transform_request_body(raw)
+                        log("POST %s [%s] -> %s stateful rid dead, retrying stateless bootstrap"
+                            % (self.path, model, status))
+                        body, notes = body2, notes2 + ["stateful-recovered"]
+                        resp = self._open("POST", body)
+                        status = getattr(resp, "status", getattr(resp, "code", 0))
+                        ctype = resp.headers.get("Content-Type", "")
+                        dump("req", body)
+                        if status < 400:
+                            sf_managed = True  # bootstrap response becomes chain head
+                        else:
+                            payload = resp.read()
+                            if _looks_like_html(payload, ctype):
+                                payload = json.dumps({"error": {
+                                    "code": "upstream_edge_error",
+                                    "message": "meta.ai edge returned an HTML error page (HTTP %s)" % status,
+                                    "type": "server_error"}}).encode()
+                                ctype = "application/json"
+                            preview = payload[:300].decode("utf-8", "ignore").replace("\n", " ")
+                except Exception as e:  # noqa: BLE001
+                    notes.append("stateful-recover err %s" % e)
+            if status >= 400:
+                log("POST %s [%s] -> %s %dms %s | %s" % (self.path, model, status, (time.time() - started) * 1000,
+                                                    ",".join(notes), preview))
+                out = unwrap_names(payload.decode("utf-8", "ignore")).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", ctype or "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            # else: recovery succeeded — fall through to the normal success path below,
+            # reading the NEW response (never the dead 400 body).
 
-        log("POST %s -> %s %dms | %s" % (self.path, status, (time.time() - started) * 1000,
+        log("POST %s [%s] -> %s %dms | %s" % (self.path, model, status, (time.time() - started) * 1000,
                                          ",".join(notes) or "-"))
 
         if "text/event-stream" in ctype:
-            self._relay_stream(resp)
+            self._relay_stream(resp, sk_hint, sf_managed)
             return
 
         payload = resp.read()
+        if sf_managed and sk_hint:
+            try:
+                import stateful as _sf2
+                _rid = _sf2.record_from_payload(sk_hint, payload)
+                if _rid:
+                    log("  stateful %s chain -> %s" % (sk_hint[8:16], _rid[:14] + "..."))
+            except Exception:
+                pass
         if _looks_like_html(payload, ctype):
             err = json.dumps({"error": {
                 "code": "upstream_edge_error",
