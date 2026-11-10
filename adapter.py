@@ -28,6 +28,7 @@ Run:  python3 adapter.py --host 127.0.0.1 --port 20132
 """
 import argparse
 import json
+import re
 import os
 import ssl
 import sys
@@ -695,7 +696,27 @@ class Handler(BaseHTTPRequestHandler):
             if sf_managed:
                 try:
                     import stateful as _sf1
-                    if _sf1.is_rid_error(preview):
+                    # Orphan tool call (user interrupted before the tool ran): answer it with a
+                    # synthetic "not executed" output and retry on the SAME chain, keeping it alive.
+                    _tries = 0
+                    while status == 400 and _tries < 4 and "no tool output found" in preview.lower():
+                        _m = re.search(r"function call (call_[\w-]+)", preview)
+                        if not _m:
+                            break
+                        _tries += 1
+                        _bd = json.loads(body)
+                        _bd["input"] = [{"type": "function_call_output", "call_id": _m.group(1),
+                                         "output": "[Tool call was interrupted by the user before it ran; NOT executed. Effect: none.]"}] + list(_bd.get("input") or [])
+                        body = json.dumps(_bd).encode()
+                        notes = notes + ["orphan-call-closed %s" % _m.group(1)[-6:]]
+                        resp = self._open("POST", body)
+                        status = getattr(resp, "status", getattr(resp, "code", 0))
+                        ctype = resp.headers.get("Content-Type", "")
+                        if status < 400:
+                            break
+                        payload = resp.read()
+                        preview = payload[:300].decode("utf-8", "ignore").replace("\n", " ")
+                    if _sf1.is_rid_error(preview) and status >= 400:
                         _ck = _sf1.load_checkpoint(sk_hint)
                         _sf1.clear(sk_hint)
                         body2, notes2 = transform_request_body(raw)

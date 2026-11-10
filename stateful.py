@@ -433,7 +433,10 @@ def record_from_payload(sk, payload_bytes):
 
 
 _RID_ERR_HINTS = ("previous_response_id", "invalid response", "response not found",
-                  "unknown response", "expired")
+                  "unknown response", "expired",
+                  # chain head holds a tool call that never got its output (user interrupt)
+                  # or the delta's outputs belong to another response
+                  "no tool output found", "does not match any function_call")
 
 
 def is_rid_error(payload_text):
