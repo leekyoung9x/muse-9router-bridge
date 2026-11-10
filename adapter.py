@@ -61,6 +61,19 @@ MIN_MAX_OUTPUT_TOKENS = 16
 # Meta's edge occasionally accepts a request then never answers; 300s of silence is
 # already far past any useful client budget, so fail fast with a clean JSON 504.
 UPSTREAM_TIMEOUT = int(os.environ.get("MUSE_UPSTREAM_TIMEOUT", "180"))
+# Agent-discipline reminder appended to `instructions` (after the session key is computed,
+# so it never changes the cache slot or the stateful chain key). Muse forgets to set
+# notify_on_complete on background commands far more often than other models and then ends its
+# turn on a "will report back" promise; this nudges it. MUSE_AGENT_HINT=0 disables,
+# MUSE_AGENT_HINT_TEXT overrides the text.
+AGENT_HINT = os.environ.get("MUSE_AGENT_HINT", "0") == "1"
+AGENT_HINT_TEXT = os.environ.get("MUSE_AGENT_HINT_TEXT") or (
+    "Long-running work: when you start a background command (build, test, server job), always set "
+    "notify_on_complete=true, and re-read its log ~25s later to confirm it is still alive. Never end "
+    "your turn with a promise like 'I will report when done' unless a completion notice is armed. "
+    "When woken, read the exit code and log tail and say plainly whether it succeeded or died."
+)
+_HINT_MARK = "[adapter-hint]"
 
 SKIP_REQ_HEADERS = {"host", "content-length", "accept-encoding", "connection", "content-encoding"}
 SKIP_RESP_HEADERS = {"transfer-encoding", "content-encoding", "connection", "content-length"}
@@ -177,6 +190,7 @@ def transform_request_body(raw):
     # Ask for the encrypted reasoning payloads we need in order to replay them later.
     # Exception: Meta rejects `include: reasoning.encrypted_content` together with
     # `previous_response_id` (stateful chain keeps server-side history instead).
+    _apply_agent_hint(body, notes)
     if body.get("previous_response_id"):
         notes.append("stateful previous_response_id, skipping encrypted_content include")
         return json.dumps(body).encode(), notes
@@ -188,6 +202,18 @@ def transform_request_body(raw):
     body["include"] = inc
 
     return json.dumps(body).encode(), notes
+
+
+def _apply_agent_hint(body, notes):
+    """Append AGENT_HINT_TEXT to instructions once (idempotent); runs after the session key is taken."""
+    if not AGENT_HINT:
+        return
+    cur = body.get("instructions")
+    cur = cur if isinstance(cur, str) else ""
+    if _HINT_MARK in cur:
+        return
+    body["instructions"] = (cur.rstrip() + "\n\n" if cur.strip() else "") + _HINT_MARK + " " + AGENT_HINT_TEXT
+    notes.append("agent-hint")
 
 
 def unwrap_names(text):

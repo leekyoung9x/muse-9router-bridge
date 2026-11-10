@@ -72,6 +72,7 @@ Details and measurements: [docs/how-it-works.md](docs/how-it-works.md).
   9router provider setup (UI and SQL), configuration reference, verification, upgrade, uninstall,
   Docker notes.
 - **[docs/troubleshooting.md](docs/troubleshooting.md)** — error string → cause → fix.
+- **[docs/agent-stops-after-background-job.md](docs/agent-stops-after-background-job.md)** — agent goes silent after launching a long background job: cause, measured data, what is guaranteed vs only improved.
 - **[docs/quickstart.vi.md](docs/quickstart.vi.md)** — bản tóm tắt tiếng Việt.
 
 ## Layout
