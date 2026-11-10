@@ -404,9 +404,16 @@ def _apply(body, sk):
 
     new_items = [it for it in items if not _server_side(it) and fp(it) not in known]
     if not new_items:
-        # Likely a client retry of an already-sent turn: do NOT fork the
-        # chain, leave the request for the classic stateless replay path.
-        return (["stateful no-delta (probable retry), stateless fallback"], "stateless")
+        # Nothing new by hash (exact retries are already answered from the done-cache
+        # before we get here). Answering statelessly would create tool calls in an
+        # UNSTORED response that the next chained turn can never reference -> 400.
+        # Re-anchor instead: send the full history with store on; this response
+        # becomes the new chain head, so any tool call it emits lives in the chain.
+        body["store"] = True
+        _hs = [fp(it) for it in items]
+        _pending[sk] = []
+        add_hashes(sk, _hs)
+        return (["stateful bootstrap (no-delta re-anchor, store on)"], "bootstrap")
     body["input"] = new_items
     body["previous_response_id"] = rid
     body["store"] = True
