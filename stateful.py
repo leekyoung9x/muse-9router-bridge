@@ -160,6 +160,25 @@ def clear(sk):
             pass
 
 
+_pending = {}   # sk -> hashes added by the in-flight request (for rollback)
+
+
+def rollback(sk):
+    """Request failed: forget the hashes it marked as 'sent' so a retry is
+    treated as a normal chained turn, not as a duplicate."""
+    hs = _pending.pop(sk, None)
+    if not hs:
+        return
+    with _lock:
+        try:
+            c = _conn()
+            c.executemany("DELETE FROM sent WHERE sk=? AND h=?", [(sk, h) for h in hs])
+            c.commit()
+            c.close()
+        except Exception:
+            pass
+
+
 def known_hashes(sk):
     with _lock:
         try:
@@ -226,9 +245,20 @@ def save_checkpoint(sk, items):
                     x.get("text", "") for x in (c or []) if isinstance(x, dict))
                 if tx.strip():
                     last_text = tx[:500]
-        ck = {"updated": time.time(), "goal": (goal or "")[:2000], "tool_calls": len(calls),
-              "files_touched": files[-50:], "last_assistant_text": last_text,
-              "recent_calls": [by_id[c] for c in calls[-8:] if c in by_id]}
+        prev = load_checkpoint(sk) or {}
+        # Merge: a truncated/compacted client history must never shrink progress.
+        merged_files = list(prev.get("files_touched") or [])
+        for p in files:
+            if p not in merged_files:
+                merged_files.append(p)
+        seen = set(prev.get("call_ids") or [])
+        seen.update(calls)
+        ck = {"updated": time.time(), "goal": (prev.get("goal") or goal or "")[:2000],
+              "tool_calls": max(len(seen), int(prev.get("tool_calls") or 0)),
+              "call_ids": sorted(seen)[-2000:],
+              "files_touched": merged_files[-100:],
+              "last_assistant_text": last_text or prev.get("last_assistant_text"),
+              "recent_calls": [by_id[c] for c in calls[-8:] if c in by_id] or prev.get("recent_calls") or []}
         tmp = _ckpt_path(sk) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(ck, f, ensure_ascii=False)
@@ -243,6 +273,76 @@ def load_checkpoint(sk):
             return json.load(f)
     except Exception:
         return None
+
+
+def recovery_note(ck, items):
+    """Text for a recovery request, or None. Only when the client's history is
+    SHORTER than what the checkpoint remembers (compacted/truncated), because
+    a full history already carries everything."""
+    if not ck:
+        return None
+    have = sum(1 for it in items if isinstance(it, dict) and it.get("type") == "function_call")
+    if have >= int(ck.get("tool_calls") or 0):
+        return None
+    lines = ["[bridge checkpoint — earlier history was truncated; this is the progress so far]",
+             "Goal: %s" % (ck.get("goal") or "")[:1500],
+             "Tool calls completed so far: %s" % ck.get("tool_calls"),
+             "Files touched so far: %s" % ", ".join(ck.get("files_touched") or []) or "none"]
+    if ck.get("last_assistant_text"):
+        lines.append("Last assistant note: %s" % ck["last_assistant_text"][:400])
+    rc = ck.get("recent_calls") or []
+    if rc:
+        lines.append("Most recent calls: " + "; ".join(
+            "%s(%s)->%s" % (c.get("name"), (c.get("args") or "")[:80], (c.get("out") or "")[:60]) for c in rc[-5:]))
+    lines.append("Do NOT redo completed work. Continue with the next step.")
+    return "\n".join(lines)
+
+
+# ---- per-session serialisation + completed-response cache (idempotent retries) ----
+_slocks = {}
+_slocks_guard = threading.Lock()
+_done = {}          # (sk, fingerprint) -> (expires, status, ctype, payload_bytes)
+_DONE_TTL = 600
+_DONE_MAX = 200
+
+
+def session_lock(sk):
+    """One lock per session: state read -> Meta call -> chain commit is atomic
+    w.r.t. other requests of the SAME session. Single-process server, so an
+    in-RAM lock is sufficient (ThreadingHTTPServer, one adapter process)."""
+    with _slocks_guard:
+        lk = _slocks.get(sk)
+        if lk is None:
+            lk = _slocks[sk] = threading.RLock()
+        return lk
+
+
+def request_fp(raw_body):
+    try:
+        d = json.loads(raw_body)
+        d.pop("stream", None)
+        return hashlib.sha1(json.dumps(d, sort_keys=True, ensure_ascii=False,
+                                       separators=(",", ":")).encode()).hexdigest()
+    except Exception:
+        return hashlib.sha1(raw_body or b"").hexdigest()
+
+
+def done_get(sk, fp_):
+    with _lock:
+        now = time.time()
+        for k in [k for k, v in list(_done.items()) if v[0] < now]:
+            _done.pop(k, None)
+        v = _done.get((sk, fp_))
+    return v
+
+
+def done_put(sk, fp_, status, kind, ctype, payload):
+    if status != 200 or not payload:
+        return
+    with _lock:
+        if len(_done) >= _DONE_MAX:
+            _done.pop(min(_done, key=lambda k: _done[k][0]), None)
+        _done[(sk, fp_)] = (time.time() + _DONE_TTL, kind, status, ctype, payload)
 
 
 def chain_info(sk):
@@ -284,7 +384,9 @@ def _apply(body, sk):
     rid = get_chain(sk)
     if not rid:
         body["store"] = True
-        add_hashes(sk, [fp(it) for it in items])
+        _hs = [fp(it) for it in items]
+        _pending[sk] = [h for h in _hs if h not in known_hashes(sk)]
+        add_hashes(sk, _hs)
         return (["stateful bootstrap (full history, store on)"], "bootstrap")
     known = known_hashes(sk)
 
@@ -308,7 +410,9 @@ def _apply(body, sk):
     body["input"] = new_items
     body["previous_response_id"] = rid
     body["store"] = True
-    add_hashes(sk, [fp(it) for it in new_items])
+    _hs = [fp(it) for it in new_items]
+    _pending[sk] = [h for h in _hs if h not in known]
+    add_hashes(sk, _hs)
     return (["stateful chained %s (-%d old +%d new)" %
              (rid[:14] + "...", len(items) - len(new_items), len(new_items))],
             "chained")

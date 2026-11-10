@@ -216,6 +216,7 @@ class StreamPatcher:
         self.patched = 0
         self.saved = 0
         self.response_id = None  # captured from response.created/completed
+        self.completed = False
 
     # ---------- accumulation ----------
 
@@ -293,6 +294,8 @@ class StreamPatcher:
             r = d.get("response") or {}
             if isinstance(r, dict) and str(r.get("id", "")).startswith("resp_"):
                 self.response_id = r["id"]
+            if t in ("response.completed", "response.done"):
+                self.completed = True
         if t == "response.output_item.done":
             item = d.get("item") or {}
             if isinstance(item, dict) and item.get("type"):
@@ -549,6 +552,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
+        self._last = ("json", resp.status if hasattr(resp, "status") else resp.code, ctype, out)
 
     def _relay_stream(self, resp, sk_hint=None, managed=False):
         self.send_response(resp.status)
@@ -557,14 +561,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         patcher = StreamPatcher()
+        _buf = []
         try:
             for line in resp:
                 out = patcher.feed(line.decode("utf-8", "ignore")).encode()
+                _buf.append(out)
                 self.wfile.write(b"%X\r\n%s\r\n" % (len(out), out))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
+            if patcher.completed:
+                self._last = ("stream", resp.status, resp.headers.get("Content-Type", "text/event-stream"), b"".join(_buf))
             if patcher.patched:
                 log("  repaired %d empty function_call arguments" % patcher.patched)
             if managed and sk_hint and patcher.response_id:
@@ -585,8 +593,59 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- verbs ----------
 
     def do_POST(self):
-        started = time.time()
         raw = self._read_body()
+        self._last = None
+        sk, fp_ = None, None
+        try:
+            import stateful as _sfw
+            if _sfw.enabled() and SESSION_KEY and ("/responses" in self.path):
+                _d = json.loads(raw)
+                if isinstance(_d, dict) and isinstance(_d.get("input"), list):
+                    sk = _d.get("prompt_cache_key") or session_cache_key(_d)
+                    if not _sfw.decide(sk):
+                        sk = None
+                    else:
+                        fp_ = _sfw.request_fp(raw)
+        except Exception:
+            sk = None
+        if not sk:
+            return self._post_inner(raw)
+        import stateful as _sfw
+        # Serialise the whole read-state -> Meta -> commit cycle per session.
+        with _sfw.session_lock(sk):
+            hit = _sfw.done_get(sk, fp_)
+            if hit:
+                kind, status, ctype, payload = hit[1], hit[2], hit[3], hit[4]
+                log("POST %s -> %s idempotent replay of stored response (no Meta call, chain untouched)" % (self.path, status))
+                if kind == "stream":
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"%X\r\n%s\r\n" % (len(payload), payload))
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                return
+            self._last = None
+            try:
+                self._post_inner(raw)
+            except Exception:
+                _sfw.rollback(sk)
+                raise
+            if self._last and self._last[1] == 200:
+                _sfw._pending.pop(sk, None)          # committed: keep the hashes
+                _sfw.done_put(sk, fp_, self._last[1], self._last[0], self._last[2], self._last[3])
+            else:
+                _sfw.rollback(sk)                    # failed/incomplete: forget them
+
+    def _post_inner(self, raw):
+        started = time.time()
         notes = []
         body = raw
         model = "-"
@@ -611,8 +670,12 @@ class Handler(BaseHTTPRequestHandler):
                 _b0 = json.loads(body)  # transformed body: key must match transform's
                 if isinstance(_b0, dict):
                     sk_hint = _b0.get("prompt_cache_key")
+                    # Only advance the chain for requests that REALLY went out as a
+                    # managed bootstrap/chained turn. A no-delta stateless fallback
+                    # must never overwrite the chain head with an unstored response.
                     sf_managed = b"previous_response_id" not in raw and \
-                        bool(sk_hint) and _sf0.decide(sk_hint)
+                        bool(sk_hint) and _sf0.decide(sk_hint) and \
+                        any(n.startswith(("stateful bootstrap", "stateful chained")) for n in notes)
         except (ValueError, TypeError):
             pass
 
@@ -633,10 +696,22 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     import stateful as _sf1
                     if _sf1.is_rid_error(preview):
+                        _ck = _sf1.load_checkpoint(sk_hint)
                         _sf1.clear(sk_hint)
                         body2, notes2 = transform_request_body(raw)
-                        log("POST %s [%s] -> %s stateful rid dead, retrying stateless bootstrap"
-                            % (self.path, model, status))
+                        try:
+                            _bd = json.loads(body2)
+                            _inp = _bd.get("input") if isinstance(_bd, dict) else None
+                            _note = _sf1.recovery_note(_ck, _inp if isinstance(_inp, list) else [])
+                            if _note and isinstance(_inp, list):
+                                _bd["input"] = [{"type": "message", "role": "user",
+                                                 "content": [{"type": "input_text", "text": _note}]}] + _inp
+                                body2 = json.dumps(_bd).encode()
+                                notes2 = notes2 + ["checkpoint-injected"]
+                        except Exception as _e:  # noqa: BLE001
+                            notes2 = notes2 + ["checkpoint-err %s" % _e]
+                        log("POST %s [%s] -> %s stateful rid dead, retrying stateless bootstrap | %s"
+                            % (self.path, model, status, preview[:200]))
                         body, notes = body2, notes2 + ["stateful-recovered"]
                         resp = self._open("POST", body)
                         status = getattr(resp, "status", getattr(resp, "code", 0))
