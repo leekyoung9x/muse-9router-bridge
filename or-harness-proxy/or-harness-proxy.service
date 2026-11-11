@@ -1,0 +1,8 @@
+[Unit]
+Description=OpenRouter harness-header proxy
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 /opt/or-harness-proxy/proxy.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
