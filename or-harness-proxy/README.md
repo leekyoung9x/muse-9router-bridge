@@ -1,26 +1,11 @@
 # or-harness-proxy
 
-Local passthrough to OpenRouter that adds app-attribution headers, so a gateway such as 9Router is
-accepted as an "agentic harness". Needed for models like `thinkingmachines/inkling-2-small:free`, which
-return `403 ... is only available on agentic harnesses` when `HTTP-Referer` is missing or is an
-unregistered app (9Router sends `https://endpoint-proxy.local`).
+Header-setting passthrough to OpenRouter + a one-shot registrar that adds it to 9router as a custom
+provider (`orh`). Fixes `403 ... only available on agentic harnesses` without patching 9router.
 
-Measured: no header -> 403; `X-Title` alone -> 403; `HTTP-Referer` alone -> 200.
+Full explanation, measurements, install/verify/caveats: **[../docs/openrouter-harness.md](../docs/openrouter-harness.md)**
 
-- Binds 127.0.0.1:20134 only. Holds no API key; forwards the caller's `Authorization`.
-- Always overrides `HTTP-Referer`, `X-Title`, `X-OpenRouter-Categories`
-  (env: `OR_REFERER`, `OR_TITLE`, `OR_CATEGORIES`, `OR_PROXY_PORT`, `OR_UPSTREAM`).
-- Streams SSE; tool calls pass through unchanged.
+    sudo ./install.sh        # then use model  orh/thinkingmachines/inkling-2-small:free
 
-## Install
-    mkdir -p /opt/or-harness-proxy && cp proxy.py /opt/or-harness-proxy/
-    cp or-harness-proxy.service /etc/systemd/system/ && systemctl enable --now or-harness-proxy
-Needs `python3` + `aiohttp`.
-
-## 9Router
-Add an OpenAI-compatible (chat) provider: prefix `orh`, base URL `http://127.0.0.1:20134/v1`, your own
-OpenRouter key. Use model `orh/thinkingmachines/inkling-2-small:free` (not `openrouter/...`, which goes direct).
-
-## Caveats
-- This impersonates a registered app; OpenRouter may tighten the check later.
-- OpenRouter prefixes the JSON body with whitespace/newlines; strict parsers should `lstrip()` first.
+Files: `proxy.py` (127.0.0.1:20134, no key stored), `register-9router.py` (idempotent DB registration),
+`install.sh`, `or-harness-proxy.service` (reference unit; install.sh writes its own).

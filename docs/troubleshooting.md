@@ -23,6 +23,10 @@ Start with the layer that produced the error, not the client.
 | 17 | Everything works, then breaks after `npm update -g 9router` | 9router | 9router rewrote its data dir / dropped the custom provider | re-check the connection `baseUrl`; the adapter itself needs no change — that is the point of the sidecar design |
 | 18 | Agent goes silent after starting a long background build/test; red X in chat; adapter log all `200` | model / client | model ended its turn with a text promise and no completion notice was armed (stdout-redirected `watch_patterns`, no `notify_on_complete`) | not an adapter fault - see [agent-stops-after-background-job.md](agent-stops-after-background-job.md); force `notify_on_complete` in the client, optionally `MUSE_AGENT_HINT=1` |
 
+## OpenRouter `403 ... only available on agentic harnesses`
+
+Cause and fix: [openrouter-harness.md](openrouter-harness.md) (use model `orh/<id>`, not `openrouter/<id>`).
+
 ## Diagnostic commands
 
 ```bash
