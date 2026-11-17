@@ -1,0 +1,6 @@
+[Unit]
+Description=Force 9router Antigravity connections onto the agy CLI project
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/muse-bridge/scripts/fix-antigravity-project.py --db /root/.9router/db/data.sqlite --apply

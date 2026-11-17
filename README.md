@@ -73,6 +73,7 @@ Details and measurements: [docs/how-it-works.md](docs/how-it-works.md).
   Docker notes.
 - **[docs/troubleshooting.md](docs/troubleshooting.md)** — error string → cause → fix.
 - **[docs/agent-stops-after-background-job.md](docs/agent-stops-after-background-job.md)** — agent goes silent after launching a long background job: cause, measured data, what is guaranteed vs only improved.
+- **[docs/antigravity-project.md](docs/antigravity-project.md)** — Antigravity via 9router vs the `agy` CLI: the `aicode-consumers` vs `default-cli-project` mismatch behind a lone 429, and a timer-run DB guard.
 - **[docs/openrouter-harness.md](docs/openrouter-harness.md)** — OpenRouter models that reply `403 only available on agentic harnesses`: a custom 9router provider (`orh/`) pointing at a header-setting proxy, no 9router code patched, survives upgrades.
 - **[docs/quickstart.vi.md](docs/quickstart.vi.md)** — bản tóm tắt tiếng Việt.
 
@@ -83,6 +84,7 @@ adapter.py              reverse proxy in front of api.meta.ai (the actual fix)
 muse_gateway.py         entry shim for the Muse Code CLI only
 install.sh              installs both units, writes the key, repoints 9router
 scripts/selftest.sh     walks every layer and reports the failing one
+scripts/fix-antigravity-project.py  timer guard: keep Antigravity connections on the agy project
 scripts/normalize-cache.py  backfills nested Meta cache counters to top-level
                         cached_tokens so /dashboard/usage shows Muse hits
 or-harness-proxy/       OpenRouter harness-header proxy + one-shot 9router provider registration
