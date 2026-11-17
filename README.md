@@ -75,6 +75,7 @@ Details and measurements: [docs/how-it-works.md](docs/how-it-works.md).
 - **[docs/agent-stops-after-background-job.md](docs/agent-stops-after-background-job.md)** — agent goes silent after launching a long background job: cause, measured data, what is guaranteed vs only improved.
 - **[docs/antigravity-project.md](docs/antigravity-project.md)** — Antigravity via 9router vs the `agy` CLI: the `aicode-consumers` vs `default-cli-project` mismatch behind a lone 429, and a timer-run DB guard.
 - **[docs/openrouter-harness.md](docs/openrouter-harness.md)** — OpenRouter models that reply `403 only available on agentic harnesses`: a custom 9router provider (`orh/`) pointing at a header-setting proxy, no 9router code patched, survives upgrades.
+- **[docs/antigravity-system-sanitize.md](docs/antigravity-system-sanitize.md)** — Antigravity `429 RESOURCE_EXHAUSTED` (0 tokens) on harness system prompts while `agy` works: a custom 9router provider (`ags/`) pointing at a proxy that moves the system prompt into a user message, no 9router code patched, survives upgrades.
 - **[docs/quickstart.vi.md](docs/quickstart.vi.md)** — bản tóm tắt tiếng Việt.
 
 ## Layout
@@ -88,6 +89,7 @@ scripts/fix-antigravity-project.py  timer guard: keep Antigravity connections on
 scripts/normalize-cache.py  backfills nested Meta cache counters to top-level
                         cached_tokens so /dashboard/usage shows Muse hits
 or-harness-proxy/       OpenRouter harness-header proxy + one-shot 9router provider registration
+ag-sanitize-proxy/      Antigravity system-prompt sanitizer proxy + one-shot 9router provider registration
 config.env.example      every knob, documented
 docs/                   mechanism, install, troubleshooting, Vietnamese quickstart
 ```

@@ -1,0 +1,9 @@
+[Unit]
+Description=Antigravity system-prompt sanitizer proxy
+After=network.target
+[Service]
+Environment=AG_PROXY_PORT=20135
+ExecStart=/usr/bin/python3 /opt/ag-sanitize-proxy/proxy.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
